@@ -93,3 +93,31 @@ test('platform webhook rejects wrong secrets and unknown identities', async () =
     assert.equal(missing.status, 404);
   });
 });
+
+
+test('platform webhook rejects encoded request bodies before parsing or enqueueing', async () => {
+  let enqueueCalls = 0;
+  const server = createPlatformWebhookServer({
+    pool: { query: async () => { enqueueCalls += 1; throw new Error('must not enqueue'); } },
+    resolveSecret: identity => secrets[identity],
+    logger: { error() {} }
+  });
+
+  await withServer(server, async base => {
+    const response = await fetch(base + '/telegram/platform/master', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-encoding': 'gzip',
+        'x-telegram-bot-api-secret-token': secrets.master
+      },
+      body: JSON.stringify({ update_id: 126 })
+    });
+    assert.equal(response.status, 415);
+    assert.deepEqual(await response.json(), {
+      ok: false,
+      error: 'unsupported_content_encoding'
+    });
+    assert.equal(enqueueCalls, 0);
+  });
+});

@@ -75,6 +75,12 @@ function createPlatformWebhookServer({
     const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
     if (contentType !== 'application/json') return sendJson(res, 415, { ok: false, error: 'unsupported_media_type' });
 
+    const contentEncoding = String(req.headers['content-encoding'] || 'identity').trim().toLowerCase();
+    if (contentEncoding !== 'identity') {
+      req.resume();
+      return sendJson(res, 415, { ok: false, error: 'unsupported_content_encoding' });
+    }
+
     const declaredLength = req.headers['content-length'];
     if (declaredLength !== undefined) {
       const length = String(declaredLength);
