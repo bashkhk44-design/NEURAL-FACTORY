@@ -38,6 +38,17 @@ async function initProjectDatabase() {
   `);
 
   await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS client_conversations_telegram_update_dedupe_idx
+      ON client_conversations (
+        project_id,
+        role,
+        (metadata->>'telegram_update_id'),
+        content
+      )
+      WHERE metadata ? 'telegram_update_id'
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS project_specs (
       id BIGSERIAL PRIMARY KEY,
       project_id BIGINT NOT NULL REFERENCES client_projects(id) ON DELETE CASCADE,
@@ -289,11 +300,33 @@ async function addConversationMessage({
     JSON.stringify(metadata)
   ]);
 
-  if (!result.rowCount) {
-    throw new Error('المشروع غير موجود أو لا يخص هذا العميل');
+  if (result.rowCount) return result.rows[0];
+
+  if (metadata.telegram_update_id !== undefined && metadata.telegram_update_id !== null) {
+    const duplicate = await pool.query(`
+      SELECT m.*
+      FROM client_conversations m
+      JOIN client_projects p ON p.id = m.project_id
+      JOIN clients c ON c.id = p.client_id
+      WHERE m.project_id = $1
+        AND c.telegram_user_id = $2
+        AND m.role = $3
+        AND m.content = $4
+        AND m.metadata->>'telegram_update_id' = $5
+      ORDER BY m.id ASC
+      LIMIT 1
+    `, [
+      projectId,
+      String(telegramUserId),
+      role,
+      content,
+      String(metadata.telegram_update_id)
+    ]);
+
+    if (duplicate.rowCount) return duplicate.rows[0];
   }
 
-  return result.rows[0];
+  throw new Error('المشروع غير موجود أو لا يخص هذا العميل');
 }
 
 async function updateProjectName({ telegramUserId, projectId, name }) {
