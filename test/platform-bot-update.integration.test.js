@@ -142,6 +142,11 @@ test('platform Telegram updates preserve per-bot order and dead-letter jobs requ
     );
     const secondMaster = await claimPlatformJob(pool, workerId, ['telegram.master.update']);
     assert.equal(secondMaster.payload.updateId, updateIds.master[1]);
+    await completePlatformJob(pool, { jobId: secondMaster.id, workerId });
+    await pool.query(
+      "UPDATE platform_bot_inbound_updates SET state = 'processed', processed_at = NOW() WHERE bot_identity = 'master' AND update_id = $1",
+      [updateIds.master[1]]
+    );
 
     const firstIntake = await claimPlatformJob(pool, workerId, ['telegram.intake.update']);
     assert.equal(firstIntake.payload.updateId, updateIds.intake[0]);
@@ -152,6 +157,11 @@ test('platform Telegram updates preserve per-bot order and dead-letter jobs requ
     );
     const secondIntake = await claimPlatformJob(pool, workerId, ['telegram.intake.update']);
     assert.equal(secondIntake.payload.updateId, updateIds.intake[1]);
+    await completePlatformJob(pool, { jobId: secondIntake.id, workerId });
+    await pool.query(
+      "UPDATE platform_bot_inbound_updates SET state = 'processed', processed_at = NOW() WHERE bot_identity = 'intake' AND update_id = $1",
+      [updateIds.intake[1]]
+    );
 
     await enqueuePlatformBotUpdate(pool, {
       botIdentity: 'master',
@@ -199,7 +209,7 @@ test('platform Telegram updates preserve per-bot order and dead-letter jobs requ
     );
     assert.deepEqual(states.rows[0], { status: 'queued', state: 'queued' });
     const reclaimed = await claimPlatformJob(pool, workerId, ['telegram.master.update']);
-    assert.equal(reclaimed.payload.updateId, updateIds.master[1] < deadLetterId ? updateIds.master[1] : deadLetterId);
+    assert.equal(reclaimed.payload.updateId, deadLetterId);
   } finally {
     await pool.query('DELETE FROM platform_jobs WHERE idempotency_key = ANY($1::text[])', [allKeys]);
     await pool.query(
