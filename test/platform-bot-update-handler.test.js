@@ -198,3 +198,41 @@ test('platform bot update handler renews its inbox lease during long-running dis
   assert.match(renewals[0].sql, /job\.locked_by = \$3/);
   assert.match(renewals[0].sql, /job\.status = 'processing'/);
 });
+
+
+test('platform bot update handler does not complete or rewrite inbox after losing its lease during dispatch', async () => {
+  const calls = [];
+  let leaseLost = false;
+  const pool = {
+    async query(sql) {
+      calls.push(sql);
+      if (sql.includes("SET state = 'processing'")) {
+        return { rowCount: 1, rows: [{ payload: { update_id: 123, message: { text: '/lease-loss' } } }] };
+      }
+      assert.fail('lost lease must prevent any further inbox writes');
+    }
+  };
+  const handler = createPlatformBotUpdateHandler({
+    pool,
+    runtimes: {
+      master: {
+        async handleUpdate() {
+          leaseLost = true;
+        }
+      }
+    }
+  });
+
+  await assert.rejects(
+    handler(makeJob(), {
+      workerId: 'lease-loss-worker',
+      leaseSeconds: 120,
+      isLeaseLost: () => leaseLost
+    }),
+    /lease was lost during execution/
+  );
+
+  assert.equal(calls.length, 1, 'only the initial inbox claim may be written');
+  assert.equal(calls.some(sql => sql.includes("SET state = 'processed'")), false);
+  assert.equal(calls.some(sql => sql.includes("SET state = 'failed'")), false);
+});
