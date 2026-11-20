@@ -220,7 +220,7 @@ async function runInteractiveIntake(ctx, session, userMessage = '') {
     const result = advanceFallbackIntake(session.data, userMessage);
     const nextStep = result.readyForReview ? 'review' : 'ai_intake';
     await saveIntakeSession({ telegramUserId: ctx.from.id, projectId: session.project_id, step: nextStep, data: result.data });
-    await saveMessage(ctx.from.id, session.project_id, 'assistant', result.assistantMessage);
+    await saveMessage(ctx.from.id, session.project_id, 'assistant', result.assistantMessage, ctx.update?.update_id);
     if (result.readyForReview) {
       await ctx.reply('اكتمل جمع المتطلبات دون الاعتماد على المحلل الذكي. هذا ملخص طلبك:');
       await askNext(ctx, { ...session, step: 'review', data: result.data });
@@ -263,7 +263,8 @@ async function runInteractiveIntake(ctx, session, userMessage = '') {
       ctx.from.id,
       session.project_id,
       'assistant',
-      result.assistantMessage
+      result.assistantMessage,
+      ctx.update?.update_id
     );
 
     if (readyForReview) {
@@ -281,7 +282,7 @@ async function runInteractiveIntake(ctx, session, userMessage = '') {
     );
     await saveIntakeSession({ telegramUserId: ctx.from.id, projectId: session.project_id, step: 'ai_intake', data: fallback.data });
     const notice = '⚠️ المحلل الذكي غير متاح مؤقتاً بسبب حد الاستخدام أو مشكلة اتصال. حفظنا إجابتك وسنكمل جمع المواصفات بأسئلة واضحة دون فقدان ما سبق.\n\n';
-    await saveMessage(ctx.from.id, session.project_id, 'assistant', notice + fallback.assistantMessage);
+    await saveMessage(ctx.from.id, session.project_id, 'assistant', notice + fallback.assistantMessage, ctx.update?.update_id);
     await ctx.reply(notice + fallback.assistantMessage);
   }
 }
@@ -476,7 +477,8 @@ async function startIntakeBot(notifyAdmin = null, onFatal = null, options = {}) 
       ctx.from.id,
       session.project_id,
       'client',
-      `نوع النشاط: ${typeName(businessType)}`
+      `نوع النشاط: ${typeName(businessType)}`,
+      ctx.update?.update_id
     );
 
     await ctx.answerCallbackQuery();
@@ -514,7 +516,8 @@ async function startIntakeBot(notifyAdmin = null, onFatal = null, options = {}) 
       ctx.from.id,
       session.project_id,
       'client',
-      'المنصة: تيليغرام فقط'
+      'المنصة: تيليغرام فقط',
+      ctx.update?.update_id
     );
 
     await ctx.answerCallbackQuery();
@@ -786,13 +789,14 @@ async function startIntakeBot(notifyAdmin = null, onFatal = null, options = {}) 
         data
       });
 
-      await saveMessage(userId, session.project_id, 'client', text);
+      await saveMessage(userId, session.project_id, 'client', text, ctx.update?.update_id);
 
       await saveMessage(
         userId,
         session.project_id,
         'system',
-        'تم تعديل الحقل: ' + field
+        'تم تعديل الحقل: ' + field,
+        ctx.update?.update_id
       );
 
       await ctx.reply('✅ تم حفظ التعديل في المواصفات.');
