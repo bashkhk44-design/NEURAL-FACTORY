@@ -8,6 +8,7 @@ const {
   claimPlatformJob,
   completePlatformJob,
   failPlatformJob,
+  recoverExpiredPlatformJobs,
   requeueDeadLetterPlatformBotUpdate
 } = require('../platform-queue');
 const { createPlatformBotUpdateHandler } = require('../platform-bot-update-handler');
@@ -216,6 +217,98 @@ test('platform Telegram updates preserve per-bot order and dead-letter jobs requ
       'DELETE FROM platform_bot_inbound_updates WHERE (bot_identity = $1 AND update_id = ANY($2::bigint[])) OR (bot_identity = $3 AND update_id = ANY($4::bigint[])) OR (bot_identity = $1 AND update_id = $5)',
       ['master', updateIds.master, 'intake', updateIds.intake, deadLetterId]
     );
+    await pool.end();
+  }
+});
+
+
+test('platform Telegram update is reclaimed after a worker crashes while the inbox is processing', {
+  skip: !process.env.DATABASE_URL ? 'DATABASE_URL is required for the disposable PostgreSQL integration test' : false
+}, async () => {
+  const { Pool } = require('pg');
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL.includes('localhost') || process.env.DATABASE_URL.includes('127.0.0.1')
+      ? false
+      : { rejectUnauthorized: false },
+    max: 5
+  });
+  const updateId = Number(BigInt(Date.now()) * 1000n + 90000n);
+  const jobType = 'telegram.master.update';
+  const key = 'telegram.master.update:' + updateId;
+  const crashedWorker = 'crashed-platform-worker-' + randomUUID();
+  const recoveryWorker = 'recovery-platform-worker-' + randomUUID();
+  let inboxId;
+
+  try {
+    const accepted = await enqueuePlatformBotUpdate(pool, {
+      botIdentity: 'master',
+      update: { update_id: updateId, message: { text: '/crash-recovery' } }
+    });
+    inboxId = accepted.id;
+
+    const abandoned = await claimPlatformJob(pool, crashedWorker, [jobType]);
+    assert.equal(abandoned.payload.updateId, updateId);
+
+    await pool.query(
+      `UPDATE platform_bot_inbound_updates
+       SET state = 'processing', attempts = attempts + 1,
+           locked_by = $2, locked_at = NOW() - INTERVAL '10 minutes'
+       WHERE id = $1`,
+      [inboxId, crashedWorker]
+    );
+    await pool.query(
+      "UPDATE platform_jobs SET locked_at = NOW() - INTERVAL '10 minutes' WHERE id = $1",
+      [abandoned.id]
+    );
+
+    const recovered = await recoverExpiredPlatformJobs(pool, 10, [jobType]);
+    assert.ok(recovered.some(row => String(row.id) === String(abandoned.id)));
+    const retry = await pool.query(
+      'SELECT status FROM platform_jobs WHERE id = $1',
+      [abandoned.id]
+    );
+    assert.equal(retry.rows[0].status, 'retrying');
+
+    const reclaimed = await claimPlatformJob(pool, recoveryWorker, [jobType]);
+    assert.equal(reclaimed.payload.updateId, updateId);
+
+    let dispatches = 0;
+    const handler = createPlatformBotUpdateHandler({
+      pool,
+      leaseSeconds: 120,
+      runtimes: {
+        master: {
+          async handleUpdate(update) {
+            dispatches += 1;
+            assert.equal(update.update_id, updateId);
+          }
+        }
+      }
+    });
+    const result = await handler(reclaimed, {
+      workerId: recoveryWorker,
+      leaseSeconds: 120,
+      isLeaseLost: () => false
+    });
+    assert.equal(result.processed, true);
+    assert.equal(dispatches, 1);
+    await completePlatformJob(pool, { jobId: reclaimed.id, workerId: recoveryWorker });
+
+    const finalState = await pool.query(
+      `SELECT inbox.state, job.status
+       FROM platform_bot_inbound_updates AS inbox
+       JOIN platform_jobs AS job
+         ON job.job_type = $1 AND job.idempotency_key = $2
+       WHERE inbox.id = $3`,
+      [jobType, key, inboxId]
+    );
+    assert.deepEqual(finalState.rows[0], { state: 'processed', status: 'completed' });
+  } finally {
+    await pool.query('DELETE FROM platform_jobs WHERE job_type = $1 AND idempotency_key = $2', [jobType, key]);
+    if (inboxId) {
+      await pool.query('DELETE FROM platform_bot_inbound_updates WHERE id = $1', [inboxId]);
+    }
     await pool.end();
   }
 });
