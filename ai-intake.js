@@ -2,6 +2,12 @@
 
 const { generateText } = require('./ai-router');
 
+// Platform-wide defaults: each project may later select a concrete target during deployment planning.
+const FACTORY_ARCHITECTURE = Object.freeze({
+  hostingModel: 'hybrid',
+  adminPanel: 'optional'
+});
+
 const FIELDS = [
   'description',
   'features',
@@ -59,7 +65,7 @@ function normalizeIntakeResult(raw, currentData = {}) {
     }
   }
 
-  const data = { ...currentData, ...fields };
+  const data = { ...currentData, ...fields, factoryArchitecture: { ...FACTORY_ARCHITECTURE } };
   const rawAssistantMessage = typeof raw.assistant_message === 'string'
     ? raw.assistant_message.trim().slice(0, 3000)
     : '';
@@ -130,6 +136,9 @@ async function processIntakeTurn({ project, currentData = {}, userMessage = '', 
 - إذا ذكر العميل عدة تفاصيل في رسالة واحدة، استخرجها كلها ولا تطلب إعادة شرحها.
 - اجمع المتطلبات تدريجياً: هدف المشروع، رحلة العميل، الميزات، الأدوار والصلاحيات، البيانات، الإشعارات، المدفوعات والتكاملات، الحالات الاستثنائية، اللغة والتصميم.
 - لا تفترض أن كل مشروع يحتاج دفعاً أو موقعاً أو قاعدة بيانات خارجية؛ اسأل فقط ما يلزم لنوع النشاط.
+- سياسة المصنع الافتراضية للاستضافة hybrid: يمكن تجهيز المشروع لاستضافة المصنع أو العميل أو توزيع المكونات بينهما؛ لا تختر هدف استضافة فعلياً قبل قرار خاص بالمشروع وموافقة النشر.
+- لوحة الإدارة optional: لا تنشئ لوحة تلقائياً؛ حدّد الحاجة إليها من وظائف المشروع، ويمكن أن تكون إدارة المشروع من بوت Telegram فقط إذا كان ذلك كافياً.
+- هذه سياسة منصة ثابتة وليست اختياراً حراً للنموذج؛ لا تغيّرها ولا تطلب من العميل اختيارها في كل مرة.
 - إذا كانت الإجابة غامضة أو متعارضة، اسأل سؤالاً واحداً يزيل الغموض.
 - لا تخترع مواصفات ولا تحوّل اقتراحاتك إلى حقائق مؤكدة.
 - لا تطلب كلمات مرور أو رموز تحقق أو مفاتيح API أو بيانات بطاقات مصرفية أو أسراراً من العميل.
@@ -167,7 +176,8 @@ async function processIntakeTurn({ project, currentData = {}, userMessage = '', 
     },
     knownSpecification: known,
     latestClientMessage: String(userMessage || '').slice(0, 5000),
-    recentConversation: safeHistory
+    recentConversation: safeHistory,
+    factoryArchitecture: FACTORY_ARCHITECTURE
   });
 
   const response = await generateText({
@@ -225,6 +235,7 @@ function advanceFallbackIntake(currentData = {}, userMessage = '') {
 }
 
 module.exports = {
+  FACTORY_ARCHITECTURE,
   FIELDS,
   advanceFallbackIntake,
   extractJson,

@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  FACTORY_ARCHITECTURE,
   extractJson,
   normalizeIntakeResult
 } = require('../ai-intake');
@@ -142,4 +143,22 @@ test('AI intake asks about a model-reported gap instead of claiming completion',
   assert.equal(result.readyForReview, false);
   assert.match(result.assistantMessage, /تحديد سياسة الإلغاء/);
   assert.match(result.assistantMessage, /ما التفاصيل/);
+});
+
+
+test('AI intake always applies the platform hybrid hosting and optional admin policy', () => {
+  const result = normalizeIntakeResult({
+    assistant_message: 'ما الوظائف المطلوبة؟',
+    fields: { description: 'متجر', factoryArchitecture: { hostingModel: 'customer', adminPanel: 'required' } },
+    missing_items: [],
+    ready_for_review: false
+  }, {
+    factoryArchitecture: { hostingModel: 'factory', adminPanel: 'disabled' }
+  });
+
+  assert.deepEqual(FACTORY_ARCHITECTURE, {
+    hostingModel: 'hybrid',
+    adminPanel: 'optional'
+  });
+  assert.deepEqual(result.data.factoryArchitecture, FACTORY_ARCHITECTURE);
 });
