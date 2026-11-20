@@ -47,9 +47,9 @@ test('conversation inserts use Telegram update metadata to suppress redelivered 
       content: 'hello',
       metadata: { telegram_update_id: '9001' }
     });
-    assert.match(captured.sql, /ON CONFLICT \(project_id, role, \(metadata->>'telegram_update_id'\), content\)/);
+    assert.match(calls[0].sql, /ON CONFLICT \(project_id, role, \(metadata->>'telegram_update_id'\), content\)/);
     assert.match(captured.sql, /WHERE \(metadata \? 'telegram_update_id'\)/);
-    assert.equal(captured.params[4], '9001');
+    assert.equal(calls[0].params[4], JSON.stringify({ telegram_update_id: '9001' }));
     assert.equal(calls.length, 2, 'duplicate conflict must be resolved by reading the existing owned message');
     assert.match(calls[1].sql, /m.metadata->>'telegram_update_id' = \$5/);
     assert.equal(calls[1].params[4], '9001');
