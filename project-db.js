@@ -277,6 +277,9 @@ async function addConversationMessage({
     FROM client_projects p
     JOIN clients c ON c.id = p.client_id
     WHERE p.id = $1 AND c.telegram_user_id = $2
+    ON CONFLICT (project_id, role, (metadata->>'telegram_update_id'), content)
+      WHERE (metadata ? 'telegram_update_id')
+    DO NOTHING
     RETURNING *
   `, [
     projectId,
