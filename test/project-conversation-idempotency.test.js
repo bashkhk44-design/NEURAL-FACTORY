@@ -29,10 +29,13 @@ function loadProjectDb(pool) {
 
 test('conversation inserts use Telegram update metadata to suppress redelivered duplicate messages', async () => {
   let captured;
+  const calls = [];
   const pool = {
     async query(sql, params) {
+      calls.push({ sql, params });
       captured = { sql, params };
-      return { rowCount: 0, rows: [] };
+      if (calls.length === 1) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [{ id: '77', content: 'hello' }] };
     }
   };
   const loaded = loadProjectDb(pool);
@@ -46,7 +49,10 @@ test('conversation inserts use Telegram update metadata to suppress redelivered 
     });
     assert.match(captured.sql, /ON CONFLICT \(project_id, role, \(metadata->>'telegram_update_id'\), content\)/);
     assert.match(captured.sql, /WHERE \(metadata \? 'telegram_update_id'\)/);
-    assert.equal(captured.params[4], JSON.stringify({ telegram_update_id: '9001' }));
+    assert.equal(captured.params[4], '9001');
+    assert.equal(calls.length, 2, 'duplicate conflict must be resolved by reading the existing owned message');
+    assert.match(calls[1].sql, /m.metadata->>'telegram_update_id' = \$5/);
+    assert.equal(calls[1].params[4], '9001');
   } finally {
     loaded.restore();
   }
