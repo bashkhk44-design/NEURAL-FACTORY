@@ -59,12 +59,15 @@ const TYPES = [
   ['other', '✨ نشاط آخر']
 ];
 
-async function saveMessage(userId, projectId, role, content) {
+async function saveMessage(userId, projectId, role, content, updateId = null) {
   await addConversationMessage({
     telegramUserId: userId,
     projectId,
     role,
-    content
+    content,
+    metadata: updateId === null || updateId === undefined
+      ? {}
+      : { telegram_update_id: String(updateId) }
   });
 }
 
@@ -73,7 +76,8 @@ async function replySaved(ctx, session, text, extra = {}) {
     ctx.from.id,
     session.project_id,
     'assistant',
-    text
+    text,
+    ctx.update?.update_id
   );
 
   return ctx.reply(text, extra);
@@ -747,7 +751,7 @@ async function startIntakeBot(notifyAdmin = null, onFatal = null, options = {}) 
     }
 
     if (!session.step.startsWith('edit_')) {
-      await saveMessage(userId, session.project_id, 'client', text);
+      await saveMessage(userId, session.project_id, 'client', text, ctx.update?.update_id);
     }
 
     if (session.step.startsWith('edit_')) {
