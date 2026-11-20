@@ -121,3 +121,37 @@ test('platform webhook rejects encoded request bodies before parsing or enqueuei
     assert.equal(enqueueCalls, 0);
   });
 });
+
+
+test('platform webhook returns 503 when durable database enqueue fails', async () => {
+  let enqueueCalls = 0;
+  const errors = [];
+  const server = createPlatformWebhookServer({
+    pool: {
+      query: async () => {
+        enqueueCalls += 1;
+        throw new Error('database unavailable');
+      }
+    },
+    resolveSecret: identity => secrets[identity],
+    logger: { error: (...args) => errors.push(args) }
+  });
+
+  await withServer(server, async base => {
+    const response = await fetch(base + '/telegram/platform/master', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-telegram-bot-api-secret-token': secrets.master
+      },
+      body: JSON.stringify({ update_id: 127, message: { text: '/start' } })
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      ok: false,
+      error: 'temporarily_unavailable'
+    });
+    assert.equal(enqueueCalls, 1);
+    assert.equal(errors.length, 1);
+  });
+});
