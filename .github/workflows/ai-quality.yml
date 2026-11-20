@@ -1,0 +1,219 @@
+name: AI Suite Quality
+
+on:
+  push:
+    branches:
+      - main
+      - feature/ai-suite-hardening
+      - foundation/durable-queue-workers-v1
+      - feat/runtime-health-monitor
+      - feat/safe-auto-remediation
+      - audit-hardening
+      - cloudflare-ci-staging-branch
+      - 'cloudflare-*'
+  pull_request:
+    branches:
+      - main
+      - audit-hardening
+      - feat/runtime-health-monitor
+
+permissions:
+  contents: read
+
+jobs:
+  ai-quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Validate Termux launcher syntax and root resolution
+        run: |
+          bash -n scripts/termux-worker.sh
+          grep -Fq 'ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"' scripts/termux-worker.sh
+      - name: Run AI quality tests
+        run: npm test
+      - name: Bundle Cloudflare Worker without deploying
+        if: matrix.node-version == 24
+        run: npx --yes wrangler@4 deploy --dry-run --config cloudflare/wrangler.bundle-test.jsonc --outdir /tmp/boss-platform-worker-bundle
+      - name: Validate isolated staging Worker config without deploying
+        if: matrix.node-version == 24
+        run: npx --yes wrangler@4 deploy --dry-run --config cloudflare/wrangler.staging.jsonc --outdir /tmp/boss-platform-worker-staging-bundle
+
+  database-migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: boss
+          POSTGRES_PASSWORD: boss_test_password
+          POSTGRES_DB: boss_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boss -d boss_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://boss:boss_test_password@localhost:5432/boss_test
+      DATABASE_SSL: disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Create pre-existing application schema
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE clients (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_user_id BIGINT NOT NULL UNIQUE
+          );
+          CREATE TABLE client_projects (
+            id BIGSERIAL PRIMARY KEY,
+            client_id BIGINT NOT NULL REFERENCES clients(id) ON DELETE CASCADE
+          );
+          CREATE TABLE telegram_bots (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            username TEXT,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            token_ciphertext TEXT,
+            token_iv TEXT,
+            token_auth_tag TEXT,
+            token_fingerprint TEXT
+          );
+          INSERT INTO clients (telegram_user_id) VALUES (10001);
+          INSERT INTO client_projects (client_id) VALUES (1);
+          INSERT INTO telegram_bots (name, username) VALUES ('fixture bot', 'fixture_bot');
+          SQL
+      - name: Apply migration from a clean database
+        run: npm run db:migrate
+      - name: Verify migration is idempotent
+        run: npm run db:migrate
+      - name: Exercise real PostgreSQL queue operations
+        run: node --test test/platform-queue.integration.test.js
+      - name: Exercise isolated platform bot inbox on disposable PostgreSQL
+        run: node --test test/platform-bot-inbox.integration.test.js
+      - name: Exercise atomic platform bot update dispatch on disposable PostgreSQL
+        run: node --test test/platform-bot-update.integration.test.js
+      - name: Exercise isolated deployment worker on disposable PostgreSQL
+        run: node --test test/deployment-preflight-worker.postgres.integration.test.js
+      - name: Exercise deployment worker lease recovery on disposable PostgreSQL
+        run: node --test test/deployment-preflight-worker.recovery.integration.test.js
+      - name: Exercise deployment worker heartbeat on disposable PostgreSQL
+        run: node --test test/deployment-preflight-worker.heartbeat.integration.test.js
+      - name: Exercise concurrent distributed bot claims
+        run: node --test test/customer-bot-worker.integration.test.js
+      - name: Exercise distributed manager bot controls
+        run: node --test test/customer-bot-worker-control.integration.test.js
+      - name: Exercise durable automatic remediation
+        run: node --test test/auto-remediation.integration.test.js
+      - name: Exercise release approval and immutable artifact workflow
+        run: node --test test/project-release.integration.test.js
+      - name: Verify schema, constraints, and preserved rows
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            migration_count INTEGER;
+            bot_count INTEGER;
+            table_count INTEGER;
+            ownership_constraint_count INTEGER;
+            command_table_count INTEGER;
+            command_migration_count INTEGER;
+          BEGIN
+            SELECT COUNT(*) INTO migration_count
+              FROM schema_migrations WHERE version = '001_foundation_database';
+            SELECT COUNT(*) INTO bot_count FROM telegram_bots;
+            SELECT COUNT(*) INTO table_count
+              FROM information_schema.tables
+              WHERE table_schema = 'public'
+                AND table_name IN (
+                  'bot_runtime_status', 'bot_inbound_updates',
+                  'platform_jobs', 'ai_usage', 'platform_audit_logs'
+                );
+            SELECT COUNT(*) INTO command_table_count
+              FROM information_schema.tables
+              WHERE table_schema = 'public' AND table_name = 'bot_runtime_commands';
+            SELECT COUNT(*) INTO command_migration_count
+              FROM schema_migrations WHERE version = '003_bot_runtime_commands';
+            IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'bot_worker_status') THEN
+              RAISE EXCEPTION 'Worker heartbeat table was not created';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '005_worker_health_heartbeats') THEN
+              RAISE EXCEPTION 'Worker heartbeat migration was not recorded';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'platform_bot_inbound_updates') THEN
+              RAISE EXCEPTION 'Platform bot inbox table was not created';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '007_platform_bot_inbox') THEN
+              RAISE EXCEPTION 'Platform bot inbox migration was not recorded';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '006_auto_remediation_audit') THEN
+              RAISE EXCEPTION 'Automatic remediation audit migration was not recorded';
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM information_schema.tables
+              WHERE table_schema = 'public' AND table_name = 'bot_auto_remediation_attempts'
+            ) THEN
+              RAISE EXCEPTION 'Automatic remediation audit table was not created';
+            END IF;
+            SELECT COUNT(*) INTO ownership_constraint_count
+              FROM pg_constraint
+              WHERE conname IN (
+                'telegram_bots_project_requires_client',
+                'platform_jobs_project_requires_client',
+                'ai_usage_project_requires_client',
+                'platform_audit_project_requires_client'
+              );
+            IF migration_count <> 1 OR bot_count <> 1 OR table_count <> 5
+               OR ownership_constraint_count <> 4 OR command_table_count <> 1
+               OR command_migration_count <> 1 THEN
+              RAISE EXCEPTION 'Migration verification failed: migrations %, bots %, tables %, ownership checks %',
+                migration_count, bot_count, table_count, ownership_constraint_count;
+            END IF;
+          END $$;
+          SQL
+
+  sandbox-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Pull official Node image and resolve immutable digest
+        run: |
+          docker pull node:22-alpine
+          IMAGE="$(docker image inspect --format '{{index .RepoDigests 0}}' node:22-alpine)"
+          case "$IMAGE" in *@sha256:*) ;; *) echo "Could not resolve immutable image digest"; exit 1 ;; esac
+          echo "BOSS_SANDBOX_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Exercise the real isolated Docker sandbox
+        env:
+          BOSS_SANDBOX_ENABLED: YES
+        run: node --test test/project-sandbox.integration.test.js
+      - name: Exercise isolated deployment preflight
+        env:
+          BOSS_SANDBOX_ENABLED: YES
+        run: node --test test/deployment-preflight.integration.test.js

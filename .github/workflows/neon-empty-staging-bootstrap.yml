@@ -1,0 +1,181 @@
+name: Neon Empty Staging Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_target:
+        description: "اكتب BOSS-BOT-STAGING-EMPTY/production/neondb للتأكيد"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-empty-staging-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    if: ${{ inputs.confirm_target == 'BOSS-BOT-STAGING-EMPTY/production/neondb' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.NEON_EMPTY_OWNER_DATABASE_URL }}
+      DATABASE_SSL: require
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify isolated target and owner
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+          (async () => {
+            if (!process.env.DATABASE_URL) throw new Error('Missing NEON_EMPTY_OWNER_DATABASE_URL repository secret.');
+            const url = new URL(process.env.DATABASE_URL);
+            if (url.hostname !== 'ep-sweet-breeze-bepbeuoj.c-9.us-east-2.aws.neon.tech' || url.pathname !== '/neondb') {
+              throw new Error('Refusing: connection is not the approved BOSS-BOT-STAGING-EMPTY database.');
+            }
+            const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 1, connectionTimeoutMillis: 10000 });
+            try {
+              const r = await pool.query('SELECT current_database() AS db, current_user AS role');
+              if (r.rows[0].db !== 'neondb' || r.rows[0].role !== 'neondb_owner') {
+                throw new Error('Refusing: expected neondb database and neondb_owner role.');
+              }
+              console.log('Verified isolated target: neondb / neondb_owner.');
+              await pool.query("SELECT 1");
+              const role = await pool.query("SELECT 1 FROM pg_roles WHERE rolname = 'hyperdrive_user'");
+              if (!role.rowCount) throw new Error('Required runtime role hyperdrive_user does not exist.');
+            } finally { await pool.end(); }
+          })().catch(e => { console.error('PREFLIGHT FAILED:', e.message); process.exitCode = 1; });
+          NODE
+      - name: Initialize base application schema
+        run: |
+          node <<'NODE'
+          const { pool, initDatabase } = require('./db');
+          (async () => {
+            try { await initDatabase(); console.log('Base application schema initialized.'); }
+            finally { await pool.end(); }
+          })().catch(e => { console.error('INITIALIZATION FAILED:', e.message); process.exitCode = 1; });
+          NODE
+      - name: Apply ordered SQL migrations
+        run: npm run db:migrate
+      - name: Grant least-privilege runtime access
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+          const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 1 });
+          (async () => {
+            try {
+              const who = await pool.query('SELECT current_user');
+              if (who.rows[0].current_user !== 'neondb_owner') throw new Error('Grant step requires neondb_owner.');
+              await pool.query('GRANT USAGE ON SCHEMA public TO hyperdrive_user');
+              await pool.query('REVOKE CREATE ON SCHEMA public FROM hyperdrive_user');
+              await pool.query('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO hyperdrive_user');
+              await pool.query('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO hyperdrive_user');
+              await pool.query('ALTER DEFAULT PRIVILEGES FOR ROLE neondb_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO hyperdrive_user');
+              await pool.query('ALTER DEFAULT PRIVILEGES FOR ROLE neondb_owner IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO hyperdrive_user');
+              console.log('Runtime privileges granted to hyperdrive_user.');
+            } finally { await pool.end(); }
+          })().catch(e => { console.error('GRANTS FAILED:', e.message); process.exitCode = 1; });
+          NODE
+      - name: Verify schema and migrations
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+          const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 1 });
+          const expectedTables = [
+                'clients',
+                'client_projects',
+                'client_conversations',
+                'project_specs',
+                'project_events',
+                'client_intake_sessions',
+                'project_secrets',
+                'project_ai_jobs',
+                'project_ai_job_attempts',
+                'project_build_approvals',
+                'project_release_candidates',
+                'project_release_approvals',
+                'project_deployment_authorizations',
+                'telegram_bots',
+                'schema_migrations',
+                'bot_runtime_status',
+                'bot_worker_status',
+                'bot_inbound_updates',
+                'platform_jobs',
+                'ai_usage',
+                'platform_audit_logs',
+                'bot_runtime_commands',
+                'bot_auto_remediation_attempts',
+                'platform_bot_inbound_updates',
+              ];
+          (async () => {
+            try {
+              const identity = await pool.query('SELECT current_database() db, current_user role');
+              if (identity.rows[0].db !== 'neondb' || identity.rows[0].role !== 'neondb_owner') throw new Error('Unexpected database identity.');
+              const tables = await pool.query(
+                "SELECT name, to_regclass('public.' || name) IS NOT NULL AS present FROM unnest($1::text[]) AS t(name)",
+                [expectedTables]
+              );
+              const missing = tables.rows.filter(x => !x.present).map(x => x.name);
+              if (missing.length) throw new Error('Missing tables: ' + missing.join(', '));
+              const migrations = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
+              const applied = new Set(migrations.rows.map(x => x.version));
+              const required = [
+                '001_foundation_database',
+                '002_distributed_bot_worker_indexes',
+                '003_bot_runtime_commands',
+                '004_manager_command_recovery',
+                '005_worker_health_heartbeats',
+                '006_auto_remediation_audit',
+                '007_platform_bot_inbox',
+                '20261118_bot_runtime_status',
+                '20261119_bot_inbound_update_lease_owner',
+                '20261119_bot_update_transport',
+              ];
+              const missingMigrations = required.filter(x => !applied.has(x));
+              if (missingMigrations.length) throw new Error('Missing migrations: ' + missingMigrations.join(', '));
+
+              const requiredColumns = [
+                ['bot_inbound_updates', 'locked_by'],
+                ['telegram_bots', 'update_transport']
+              ];
+              const columnResult = await pool.query(
+                `SELECT expected.table_name, expected.column_name
+                 FROM unnest($1::text[], $2::text[])
+                   AS expected(table_name, column_name)
+                 WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM information_schema.columns c
+                   WHERE c.table_schema = 'public'
+                     AND c.table_name = expected.table_name
+                     AND c.column_name = expected.column_name
+                 )`,
+                [
+                  requiredColumns.map(x => x[0]),
+                  requiredColumns.map(x => x[1])
+                ]
+              );
+              if (columnResult.rows.length) {
+                throw new Error(
+                  'Missing required columns: ' +
+                  columnResult.rows.map(x => x.table_name + '.' + x.column_name).join(', ')
+                );
+              }
+
+              const grants = await pool.query("SELECT has_table_privilege('hyperdrive_user', 'public.telegram_bots', 'SELECT') AS can_read, has_table_privilege('hyperdrive_user', 'public.telegram_bots', 'INSERT') AS can_insert, has_sequence_privilege('hyperdrive_user', pg_get_serial_sequence('public.telegram_bots','id'), 'USAGE') AS can_use_sequence, has_schema_privilege('hyperdrive_user','public','CREATE') AS can_create");
+              const g = grants.rows[0];
+              if (!g.can_read || !g.can_insert || !g.can_use_sequence || g.can_create) throw new Error('Runtime grants are not least-privilege or incomplete.');
+              console.log('SUCCESS: all expected tables, migrations, and runtime permissions verified.');
+              console.log('Tables verified:', expectedTables.length, '| migrations verified:', required.length);
+            } finally { await pool.end(); }
+          })().catch(e => { console.error('VERIFICATION FAILED:', e.message); process.exitCode = 1; });
+          NODE

@@ -1,0 +1,48 @@
+name: Telegram Live Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_send:
+        description: 'Send one quiet test message to the configured test chat'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-live-smoke
+  cancel-in-progress: false
+
+jobs:
+  telegram-live-smoke:
+    if: inputs.confirm_send == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify test secrets are configured
+        env:
+          BOT_TOKEN: ${{ secrets.BOSS_TEST_TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.BOSS_TEST_TELEGRAM_CHAT_ID }}
+        run: |
+          test -n "$BOT_TOKEN" || { echo "Missing BOSS_TEST_TELEGRAM_BOT_TOKEN"; exit 1; }
+          test -n "$CHAT_ID" || { echo "Missing BOSS_TEST_TELEGRAM_CHAT_ID"; exit 1; }
+
+      - name: Run isolated smoke-test unit checks
+        run: node --test test/telegram-live-smoke.test.js
+
+      - name: Verify Telegram identity and send one test message
+        env:
+          BOSS_TEST_TELEGRAM_BOT_TOKEN: ${{ secrets.BOSS_TEST_TELEGRAM_BOT_TOKEN }}
+          BOSS_TEST_TELEGRAM_CHAT_ID: ${{ secrets.BOSS_TEST_TELEGRAM_CHAT_ID }}
+        run: node scripts/telegram-live-smoke.js

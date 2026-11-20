@@ -1,0 +1,66 @@
+name: Deploy BOSS BOT Platform Cloudflare Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type DEPLOY-BOSS-STAGING to deploy the isolated staging ingress Worker
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boss-bot-platform-cloudflare-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    if: ${{ inputs.confirmation == 'DEPLOY-BOSS-STAGING' }}
+    runs-on: ubuntu-latest
+    environment: boss-platform-staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify isolated staging configuration
+        shell: bash
+        env:
+          STAGING_HYPERDRIVE_ID: ${{ secrets.CLOUDFLARE_STAGING_HYPERDRIVE_ID }}
+        run: |
+          set -euo pipefail
+          CONFIG="cloudflare/wrangler.staging.jsonc"
+          if [[ ! "$STAGING_HYPERDRIVE_ID" =~ ^[a-f0-9]{32}$ ]]; then
+            echo "Missing or invalid CLOUDFLARE_STAGING_HYPERDRIVE_ID."
+            exit 1
+          fi
+          sed -i "s/REPLACE_WITH_VERIFIED_STAGING_HYPERDRIVE_ID/$STAGING_HYPERDRIVE_ID/g" "$CONFIG"
+          grep -Fq '"name": "boss-bot-platform-ingress-staging"' "$CONFIG"
+          grep -Fq "\"id\": \"$STAGING_HYPERDRIVE_ID\"" "$CONFIG"
+          grep -Fq '"PLATFORM_BOT_WEBHOOK_MODE": "disabled"' "$CONFIG"
+          grep -Fq '"workers_dev": true' "$CONFIG"
+          if grep -Eq "REPLACE_WITH|production|prod-" "$CONFIG"; then
+            echo "Unsafe or unresolved staging configuration detected."
+            exit 1
+          fi
+          echo "Staging configuration verified successfully."
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Worker dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Deploy only the isolated staging Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          npx --yes wrangler@4 deploy --config cloudflare/wrangler.staging.jsonc

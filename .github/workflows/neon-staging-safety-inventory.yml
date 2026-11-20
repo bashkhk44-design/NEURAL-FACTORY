@@ -1,0 +1,158 @@
+name: Neon STAGING Safety Branch Inventory (Read Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_target:
+        description: "اكتب STAGING-SAFETY-READ-ONLY لتأكيد فحص فرع الحماية فقط"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-staging-safety-inventory-read-only
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    if: ${{ github.ref == 'refs/heads/ops/cloudflare-staging-isolation' && inputs.confirm_target == 'STAGING-SAFETY-READ-ONLY' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.STAGING_SAFETY_DATABASE_URL }}
+    steps:
+      - name: Checkout reviewed staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: ops/cloudflare-staging-isolation
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify exact safety branch and inspect schema using SELECT only
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+
+          const expectedHost = 'ep-jolly-dust-bep7yrxv.c-9.us-east-2.aws.neon.tech';
+          const expectedTables = [
+            'telegram_bots',
+            'clients',
+            'client_projects',
+            'client_conversations',
+            'project_specs',
+            'project_events',
+            'client_intake_sessions',
+            'project_secrets',
+            'project_ai_jobs',
+            'project_ai_job_attempts',
+            'project_build_approvals',
+            'project_release_candidates',
+            'project_release_approvals',
+            'project_deployment_authorizations',
+            'schema_migrations',
+            'bot_runtime_status',
+            'bot_inbound_updates',
+            'platform_jobs',
+            'ai_usage',
+            'platform_audit_logs',
+            'bot_runtime_commands',
+            'bot_worker_status',
+            'bot_auto_remediation_attempts',
+            'platform_bot_inbound_updates'
+          ];
+
+          async function main() {
+            if (!process.env.DATABASE_URL) {
+              throw new Error('Missing STAGING_SAFETY_DATABASE_URL repository secret.');
+            }
+
+            const target = new URL(process.env.DATABASE_URL);
+            if (target.hostname !== expectedHost || target.pathname !== '/neondb') {
+              throw new Error('Refusing connection: target is not the approved pre-migrations safety branch.');
+            }
+
+            const pool = new Pool({
+              connectionString: process.env.DATABASE_URL,
+              ssl: { rejectUnauthorized: false },
+              max: 1,
+              connectionTimeoutMillis: 10000,
+              statement_timeout: 15000,
+              query_timeout: 20000
+            });
+
+            try {
+              const identity = await pool.query(
+                'SELECT current_database() AS db, current_user AS role, current_schema() AS current_schema, version() AS server_version'
+              );
+              const who = identity.rows[0];
+              if (who.db !== 'neondb' || who.role !== 'neondb_owner') {
+                throw new Error('Refusing inspection: expected database neondb and role neondb_owner.');
+              }
+
+              const tables = await pool.query(
+                "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name"
+              );
+              const columns = await pool.query(
+                "SELECT table_schema, table_name, ordinal_position, column_name, data_type, udt_name, is_nullable, column_default FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name, ordinal_position"
+              );
+              const constraints = await pool.query(
+                "SELECT n.nspname AS table_schema, t.relname AS table_name, c.conname AS constraint_name, c.contype AS constraint_type, pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') ORDER BY n.nspname, t.relname, c.conname"
+              );
+              const indexes = await pool.query(
+                "SELECT schemaname AS table_schema, tablename AS table_name, indexname AS index_name, indexdef AS definition FROM pg_indexes WHERE schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY schemaname, tablename, indexname"
+              );
+
+              const actual = new Set(tables.rows
+                .filter(row => row.table_schema === 'public' && row.table_type === 'BASE TABLE')
+                .map(row => row.table_name));
+              const expected = new Set(expectedTables);
+              const missing = expectedTables.filter(name => !actual.has(name));
+              const extra = [...actual].filter(name => !expected.has(name));
+
+              let appliedMigrations = [];
+              if (actual.has('schema_migrations')) {
+                const result = await pool.query(
+                  'SELECT version, description, applied_at FROM public.schema_migrations ORDER BY version'
+                );
+                appliedMigrations = result.rows;
+              }
+
+              console.log('STAGING SAFETY BRANCH READ-ONLY INVENTORY SUCCEEDED');
+              console.log(JSON.stringify({
+                target: {
+                  branch_host: target.hostname,
+                  database: who.db,
+                  role: who.role,
+                  current_schema: who.current_schema,
+                  server_version: who.server_version
+                },
+                expected_table_count: expectedTables.length,
+                actual_public_table_count: actual.size,
+                missing_expected_tables: missing,
+                additional_public_tables: extra,
+                tables: tables.rows,
+                columns: columns.rows,
+                constraints: constraints.rows,
+                indexes: indexes.rows,
+                applied_migrations: appliedMigrations,
+                safety: 'Fixed SELECT statements only. No application rows, migrations, DDL, INSERT, UPDATE, or DELETE were executed.'
+              }, null, 2));
+            } finally {
+              await pool.end();
+            }
+          }
+
+          main().catch(error => {
+            console.error('SAFETY BRANCH INVENTORY FAILED:', error.message);
+            process.exitCode = 1;
+          });
+          NODE

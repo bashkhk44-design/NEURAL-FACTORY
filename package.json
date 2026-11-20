@@ -1,0 +1,31 @@
+{
+  "name": "boss-bot-master",
+  "version": "1.0.0",
+  "description": "BOSS BOT MASTER - AI-assisted bot project platform",
+  "main": "host.js",
+  "scripts": {
+    "test": "node --require ./test/no-dotenv.js --test",
+    "start": "node host.js",
+    "start:cloud": "node host.js",
+    "db:migrate": "node migrations/runner.js",
+    "worker": "node worker.js",
+    "start:worker": "node worker.js",
+    "start:webhook": "node webhook.js",
+    "start:customer-worker": "node customer-bot-worker.js",
+    "start:monitor": "node runtime-monitor.js",
+    "start:deployment-preflight-worker": "node deployment-preflight-worker.js",
+    "start:platform-worker": "node platform-worker.js",
+    "start:platform-webhook": "node platform-webhook.js"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "@google/genai": "^3.3.0",
+    "dotenv": "^18.0.10",
+    "grammy": "^1.46.0",
+    "pg": "^8.23.1"
+  },
+  "allowScripts": {
+    "protobufjs@7.6.6": true
+  }
+}

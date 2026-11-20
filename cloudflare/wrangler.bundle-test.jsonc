@@ -1,0 +1,11 @@
+{
+  "name": "boss-bot-platform-ingress-bundle-test",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "previews": {},
+  "vars": {
+    "PLATFORM_BOT_WEBHOOK_MODE": "disabled"
+  }
+}

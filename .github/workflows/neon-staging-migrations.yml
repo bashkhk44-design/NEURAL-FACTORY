@@ -1,0 +1,131 @@
+name: Neon Staging Migrations (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_target:
+        description: "اكتب STAGING-ONLY لتأكيد أنك تقصد قاعدة Neon التجريبية"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-staging-migrations-only
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    if: ${{ github.ref == 'refs/heads/ops/cloudflare-staging-isolation' && inputs.confirm_target == 'STAGING-ONLY' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.STAGING_MIGRATION_DATABASE_URL }}
+      DATABASE_SSL: require
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+        with:
+          ref: ops/cloudflare-staging-isolation
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Test staging migration allowlist
+        run: node --test migrations/runner.test.js
+
+      - name: Verify secret, exact Neon target, role, and migration set
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { Pool } = require('pg');
+
+          const expectedHost = 'ep-wispy-night-bexu4b47.c-9.us-east-2.aws.neon.tech';
+          const expectedFiles = [
+            '001_foundation_database.sql',
+            '002_distributed_bot_worker_indexes.sql',
+            '003_bot_runtime_commands.sql',
+            '004_manager_command_recovery.sql',
+            '005_worker_health_heartbeats.sql',
+            '006_auto_remediation_audit.sql',
+            '007_platform_bot_inbox.sql'
+          ];
+          const baselineFiles = [
+            '000_staging_bootstrap.sql'
+          ];
+          const explicitlyExcludedFiles = [
+            '20261118_bot_runtime_status.sql'
+          ];
+
+          async function main() {
+            if (!process.env.DATABASE_URL) {
+              throw new Error('Missing STAGING_MIGRATION_DATABASE_URL repository secret.');
+            }
+
+            const parsed = new URL(process.env.DATABASE_URL);
+            if (parsed.hostname !== expectedHost || parsed.pathname !== '/neondb') {
+              throw new Error('Refusing to connect: URL is not the explicitly approved Neon STAGING host/database.');
+            }
+
+            const actualFiles = fs.readdirSync(path.join(process.cwd(), 'migrations'))
+              .filter(name => /^\d+_[a-z0-9_-]+\.sql$/i.test(name))
+              .sort();
+
+            const recognizedNonRunnerFiles = [...baselineFiles, ...explicitlyExcludedFiles];
+            const unexpected = actualFiles.filter(name =>
+              !expectedFiles.includes(name) && !recognizedNonRunnerFiles.includes(name)
+            );
+            const missing = expectedFiles.filter(name => !actualFiles.includes(name));
+            const missingBaseline = baselineFiles.filter(name => !actualFiles.includes(name));
+            const { listMigrationFiles } = require('./migrations/runner');
+            const runnerFiles = listMigrationFiles(path.join(process.cwd(), 'migrations'));
+            if (unexpected.length || missing.length || missingBaseline.length ||
+                JSON.stringify(runnerFiles) !== JSON.stringify(expectedFiles)) {
+              throw new Error(
+                'Migration set differs from reviewed allowlist. Unexpected: ' +
+                (unexpected.join(', ') || 'none') + '; missing: ' +
+                (missing.join(', ') || 'none') + '; missing baseline: ' +
+                (missingBaseline.join(', ') || 'none') + '; runner allowlist mismatch: '
+                (JSON.stringify(runnerFiles) !== JSON.stringify(expectedFiles) ? 'yes' : 'no')
+              );
+            }
+
+            const pool = new Pool({
+              connectionString: process.env.DATABASE_URL,
+              ssl: { rejectUnauthorized: false },
+              max: 1,
+              connectionTimeoutMillis: 10000
+            });
+
+            try {
+              const result = await pool.query(
+                'SELECT current_database() AS db, current_user AS role, inet_server_addr()::text AS server_ip'
+              );
+              const row = result.rows[0];
+              if (row.db !== 'neondb' || row.role !== 'neondb_owner') {
+                throw new Error('Refusing to migrate: expected database neondb and role neondb_owner.');
+              }
+              console.log('Preflight passed: approved Neon STAGING host, database neondb, role neondb_owner.');
+              console.log('Server IP:', row.server_ip || 'not reported');
+              console.log('Reviewed migration files:', expectedFiles.length);
+            } finally {
+              await pool.end();
+            }
+          }
+
+          main().catch(error => {
+            console.error('STAGING PREFLIGHT FAILED:', error.message);
+            process.exitCode = 1;
+          });
+          NODE
+
+      - name: Finish read-only staging preflight
+        run: echo "Read-only preflight completed. No database migrations were executed."

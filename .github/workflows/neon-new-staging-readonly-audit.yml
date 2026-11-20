@@ -1,0 +1,159 @@
+name: Neon New Staging Read-Only Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_target:
+        description: "Type NEW-STAGING-READ-ONLY to confirm the isolated Neon staging target"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-new-staging-read-only-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.confirm_target == 'NEW-STAGING-READ-ONLY' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: cloudflare-staging
+    env:
+      DATABASE_URL: ${{ secrets.CLOUDFLARE_STAGING_DATABASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify exact isolated target and inspect schema (read only)
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+
+          const EXPECTED_HOST = 'ep-sweet-breeze-bepbeuoj.c-9.us-east-2.aws.neon.tech';
+          const EXPECTED_DATABASE = 'neondb';
+          const EXPECTED_ROLE = 'hyperdrive_user';
+          const REQUIRED_TABLES = [
+            'schema_migrations',
+            'platform_jobs',
+            'platform_bot_inbound_updates'
+          ];
+          const WRITE_TABLES = new Set(['platform_jobs', 'platform_bot_inbound_updates']);
+          const SERIAL_TABLES = ['platform_jobs', 'platform_bot_inbound_updates'];
+
+          async function main() {
+            if (!process.env.DATABASE_URL) {
+              throw new Error('Missing cloudflare-staging environment secret CLOUDFLARE_STAGING_DATABASE_URL.');
+            }
+
+            const target = new URL(process.env.DATABASE_URL);
+            const database = decodeURIComponent(target.pathname.slice(1));
+            const role = decodeURIComponent(target.username);
+
+            if (target.hostname !== EXPECTED_HOST ||
+                database !== EXPECTED_DATABASE ||
+                role !== EXPECTED_ROLE ||
+                target.port && target.port !== '5432' ||
+                !target.password) {
+              throw new Error('Refusing connection: URL does not match the approved isolated staging host/database/role.');
+            }
+
+            const pool = new Pool({
+              connectionString: process.env.DATABASE_URL,
+              max: 1,
+              connectionTimeoutMillis: 10000,
+              query_timeout: 10000,
+              statement_timeout: 10000
+            });
+
+            try {
+              await pool.query('BEGIN READ ONLY');
+              const identity = await pool.query(
+                'SELECT current_database() AS database, current_user AS role, current_setting(\'transaction_read_only\') AS transaction_read_only'
+              );
+              const actual = identity.rows[0];
+
+              if (actual.database !== EXPECTED_DATABASE || actual.role !== EXPECTED_ROLE) {
+                throw new Error('Connected identity does not match the approved staging database and role.');
+              }
+
+              const schema = await pool.query(
+                `SELECT required.name,
+                        to_regclass('public.' || quote_ident(required.name)) IS NOT NULL AS exists,
+                        CASE
+                          WHEN to_regclass('public.' || quote_ident(required.name)) IS NULL THEN false
+                          ELSE has_table_privilege(
+                            current_user,
+                            to_regclass('public.' || quote_ident(required.name)),
+                            'SELECT'
+                          )
+                        END AS can_select,
+                        CASE
+                          WHEN required.name <> ALL($2::text[]) THEN true
+                          WHEN to_regclass('public.' || quote_ident(required.name)) IS NULL THEN false
+                          ELSE has_table_privilege(
+                            current_user,
+                            to_regclass('public.' || quote_ident(required.name)),
+                            'INSERT'
+                          )
+                        END AS can_insert,
+                        CASE
+                          WHEN required.name <> ALL($3::text[]) THEN true
+                          WHEN pg_get_serial_sequence('public.' || quote_ident(required.name), 'id') IS NULL THEN false
+                          ELSE has_sequence_privilege(
+                            current_user,
+                            pg_get_serial_sequence('public.' || quote_ident(required.name), 'id'),
+                            'USAGE'
+                          )
+                        END AS can_use_sequence
+                   FROM unnest($1::text[]) AS required(name)
+                   ORDER BY required.name`,
+                [REQUIRED_TABLES, [...WRITE_TABLES], SERIAL_TABLES]
+              );
+
+              console.log('Target verified: isolated staging database only.');
+              console.log('Database:', actual.database);
+              console.log('Role:', actual.role);
+              console.log('Transaction read-only setting:', actual.transaction_read_only);
+              console.log('Required table inventory:');
+              for (const row of schema.rows) {
+                console.log(
+                  row.name + ': exists=' + row.exists + ', select=' + row.can_select +
+                  ', insert=' + row.can_insert + ', sequence_usage=' + row.can_use_sequence
+                );
+              }
+
+              await pool.query('COMMIT');
+
+              const missing = schema.rows.filter(row => !row.exists).map(row => row.name);
+              const denied = schema.rows.filter(row => row.exists && !row.can_select).map(row => row.name);
+              const deniedWrites = schema.rows.filter(row => row.exists && (!row.can_insert || !row.can_use_sequence)).map(row => row.name);
+              if (missing.length || denied.length || deniedWrites.length) {
+                console.log('AUDIT RESULT: INCOMPLETE');
+                if (missing.length) console.log('Missing tables:', missing.join(', '));
+                if (denied.length) console.log('Missing SELECT privileges:', denied.join(', '));
+                process.exitCode = 2;
+              } else {
+                console.log('AUDIT RESULT: REQUIRED TABLES EXIST AND ARE SELECTABLE.');
+              }
+            } finally {
+              await pool.end();
+            }
+          }
+
+          main().catch(error => {
+            console.error('READ-ONLY STAGING AUDIT FAILED:', error.message);
+            process.exitCode = 1;
+          });
+          NODE

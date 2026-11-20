@@ -1,0 +1,173 @@
+name: Bootstrap Isolated Cloudflare Staging Database
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_target:
+        description: "Type BOOTSTRAP-ISOLATED-STAGING to confirm the isolated staging database"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-isolated-cloudflare-staging
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.confirm_target == 'BOOTSTRAP-ISOLATED-STAGING' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: cloudflare-staging
+    env:
+      DATABASE_URL: ${{ secrets.CLOUDFLARE_STAGING_DATABASE_URL }}
+      OWNER_DATABASE_URL: ${{ secrets.CLOUDFLARE_STAGING_OWNER_DATABASE_URL }}
+      DATABASE_SSL: require
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify isolated target and separate migration owner
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+          const EXPECTED_HOST = 'ep-jolly-dust-bep7yrxv.c-9.us-east-2.aws.neon.tech';
+          const EXPECTED_DB = 'neondb';
+          async function verifyUrl(raw, expectedRole, label) {
+            if (!raw) throw new Error('Missing ' + label + ' database secret.');
+            const url = new URL(raw);
+            if (url.hostname !== EXPECTED_HOST ||
+                decodeURIComponent(url.pathname.slice(1)) !== EXPECTED_DB ||
+                decodeURIComponent(url.username) !== expectedRole ||
+                (url.port && url.port !== '5432') || !url.password) {
+              throw new Error('Refusing: ' + label + ' URL is not the approved isolated staging target/role.');
+            }
+            const pool = new Pool({ connectionString: raw, max: 1, connectionTimeoutMillis: 10000 });
+            try {
+              const result = await pool.query(`
+                SELECT current_database() AS db, current_user AS role,
+                       has_schema_privilege(current_user, 'public', 'USAGE') AS can_use,
+                       has_schema_privilege(current_user, 'public', 'CREATE') AS can_create
+              `);
+              const row = result.rows[0];
+              if (row.db !== EXPECTED_DB || row.role !== expectedRole) {
+                throw new Error(label + ' connected identity mismatch.');
+              }
+              if (!row.can_use || (label === 'owner' && !row.can_create)) {
+                throw new Error(label + ' role lacks required public schema privileges.');
+              }
+              if (label === 'owner') {
+                const ownership = await pool.query(`
+                  SELECT pg_get_userbyid(c.relowner) AS owner
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'public' AND c.relname = 'telegram_bots'
+                `);
+                if (!ownership.rowCount || ownership.rows[0].owner !== expectedRole) {
+                  throw new Error('Owner role does not own public.telegram_bots; stopped before changes.');
+                }
+              }
+              console.log('Verified ' + label + ' connection:', row.db + ' / ' + row.role);
+              console.log('public schema USAGE:', row.can_use, 'CREATE:', row.can_create);
+            } finally { await pool.end(); }
+          }
+          (async () => {
+            await verifyUrl(process.env.DATABASE_URL, 'hyperdrive_user', 'application');
+            await verifyUrl(process.env.OWNER_DATABASE_URL, 'neondb_owner', 'owner');
+          })().catch(error => {
+            console.error('SAFE PREFLIGHT FAILED:', error.message);
+            process.exitCode = 1;
+          });
+          NODE
+      - name: Initialize application tables
+        env:
+          DATABASE_URL: ${{ secrets.CLOUDFLARE_STAGING_OWNER_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { pool, initDatabase } = require('./db');
+          (async () => {
+            try {
+              await initDatabase();
+              console.log('Application base tables initialized.');
+            } finally { await pool.end(); }
+          })().catch(error => { console.error('APPLICATION SCHEMA INIT FAILED:', error.message); process.exitCode = 1; });
+          NODE
+      - name: Apply reviewed migrations
+        env:
+          DATABASE_URL: ${{ secrets.CLOUDFLARE_STAGING_OWNER_DATABASE_URL }}
+        run: npm run db:migrate
+      - name: Verify complete isolated staging schema
+        run: |
+          node <<'NODE'
+          const { Pool } = require('pg');
+          const expectedMigrations = [
+            '001_foundation_database',
+            '002_distributed_bot_worker_indexes',
+            '003_bot_runtime_commands',
+            '004_manager_command_recovery',
+            '005_worker_health_heartbeats',
+            '006_auto_remediation_audit',
+            '007_platform_bot_inbox',
+            '20261118_bot_runtime_status',
+            '20261119_bot_inbound_update_lease_owner',
+            '20261119_bot_update_transport'
+          ];
+          const expectedTables = [
+            'telegram_bots','clients','client_projects','client_conversations',
+            'project_specs','project_events','client_intake_sessions','project_secrets',
+            'project_ai_jobs','project_ai_job_attempts','project_build_approvals',
+            'project_release_candidates','project_release_approvals',
+            'project_deployment_authorizations','schema_migrations','platform_jobs',
+            'platform_bot_inbound_updates','bot_inbound_updates','bot_runtime_status',
+            'bot_runtime_commands','bot_worker_status','bot_auto_remediation_attempts'
+          ];
+          (async () => {
+            const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 1, connectionTimeoutMillis: 10000 });
+            try {
+              const identity = await pool.query('SELECT current_database() AS db, current_user AS role');
+              if (identity.rows[0].db !== 'neondb' || identity.rows[0].role !== 'hyperdrive_user') throw new Error('Final identity mismatch.');
+              const migrations = await pool.query('SELECT version FROM schema_migrations');
+              const applied = new Set(migrations.rows.map(row => row.version));
+              const missingMigrations = expectedMigrations.filter(v => !applied.has(v));
+              const tables = await pool.query(
+                `SELECT name, to_regclass('public.' || quote_ident(name)) IS NOT NULL AS exists
+                 FROM unnest($1::text[]) AS t(name)`, [expectedTables]
+              );
+              const missingTables = tables.rows.filter(r => !r.exists).map(r => r.name);
+              const requiredColumns = [
+                ['bot_inbound_updates', 'locked_by'],
+                ['telegram_bots', 'update_transport']
+              ];
+              const columnChecks = await pool.query(
+                `SELECT table_name, column_name
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND (table_name, column_name) IN (
+                     SELECT * FROM unnest($1::text[], $2::text[])
+                   )`,
+                [requiredColumns.map(item => item[0]), requiredColumns.map(item => item[1])]
+              );
+              const presentColumns = new Set(columnChecks.rows.map(row => row.table_name + '.' + row.column_name));
+              const missingColumns = requiredColumns
+                .map(([table, column]) => table + '.' + column)
+                .filter(name => !presentColumns.has(name));
+              console.log('Applied migrations:', [...applied].sort().join(', '));
+              console.log('Verified tables:', expectedTables.length - missingTables.length, '/', expectedTables.length);
+              console.log('Verified required columns:', requiredColumns.length - missingColumns.length, '/', requiredColumns.length);
+              if (missingMigrations.length || missingTables.length || missingColumns.length) {
+                throw new Error('Incomplete schema. Missing migrations: ' + missingMigrations.join(', ') +
+                  '; missing tables: ' + missingTables.join(', ') +
+                  '; missing columns: ' + missingColumns.join(', '));
+              }
+              console.log('SUCCESS: isolated staging database schema is initialized.');
+            } finally { await pool.end(); }
+          })().catch(error => { console.error('FINAL SCHEMA VERIFICATION FAILED:', error.message); process.exitCode = 1; });
+          NODE
