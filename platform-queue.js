@@ -87,18 +87,38 @@ async function claimPlatformJob(pool, workerId, jobTypes) {
             AND available_at <= NOW()
             AND attempts < max_attempts
             AND (
-              platform_jobs.job_type <> 'telegram.update'
-              OR NOT EXISTS (
-                SELECT 1
-                FROM bot_inbound_updates AS earlier
-                LEFT JOIN platform_jobs AS earlier_job
-                  ON earlier_job.job_type = 'telegram.update'
-                 AND earlier_job.idempotency_key =
-                   'telegram.update:' || earlier.bot_id::text || ':' || earlier.update_id::text
-                WHERE earlier.bot_id = platform_jobs.bot_id
-                  AND earlier.update_id < (platform_jobs.payload->>'updateId')::bigint
-                  AND earlier.state <> 'processed'
-                  AND COALESCE(earlier_job.status, 'queued') <> 'dead_letter'
+              (
+                platform_jobs.job_type = 'telegram.update'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM bot_inbound_updates AS earlier
+                  LEFT JOIN platform_jobs AS earlier_job
+                    ON earlier_job.job_type = 'telegram.update'
+                   AND earlier_job.idempotency_key =
+                     'telegram.update:' || earlier.bot_id::text || ':' || earlier.update_id::text
+                  WHERE earlier.bot_id = platform_jobs.bot_id
+                    AND earlier.update_id < (platform_jobs.payload->>'updateId')::bigint
+                    AND earlier.state <> 'processed'
+                    AND COALESCE(earlier_job.status, 'queued') <> 'dead_letter'
+                )
+              )
+              OR (
+                platform_jobs.job_type IN ('telegram.master.update', 'telegram.intake.update')
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM platform_bot_inbound_updates AS earlier
+                  LEFT JOIN platform_jobs AS earlier_job
+                    ON earlier_job.job_type = 'telegram.' || earlier.bot_identity || '.update'
+                   AND earlier_job.idempotency_key =
+                     'telegram.' || earlier.bot_identity || '.update:' || earlier.update_id::text
+                  WHERE earlier.bot_identity = platform_jobs.payload->>'botIdentity'
+                    AND earlier.update_id < (platform_jobs.payload->>'updateId')::bigint
+                    AND earlier.state NOT IN ('processed', 'dead_letter')
+                    AND COALESCE(earlier_job.status, 'queued') <> 'dead_letter'
+                )
+              )
+              OR platform_jobs.job_type NOT IN (
+                'telegram.update', 'telegram.master.update', 'telegram.intake.update'
               )
             )
             AND job_type = ANY($2::text[])
@@ -153,18 +173,34 @@ async function failPlatformJob(pool, { jobId, workerId, error, retryDelaySeconds
     .slice(0, MAX_ERROR_LENGTH);
   const delay = Math.max(1, Math.min(300, Number(retryDelaySeconds) || 5));
   const saved = await pool.query(`
-    UPDATE platform_jobs
-    SET status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'retrying' END,
-        available_at = CASE
-          WHEN attempts >= max_attempts THEN available_at
-          ELSE NOW() + make_interval(secs => $4::int)
-        END,
-        locked_by = NULL,
-        locked_at = NULL,
-        last_error = $3,
-        updated_at = NOW()
-    WHERE id = $1 AND locked_by = $2 AND status = 'processing'
-    RETURNING id, status, attempts, max_attempts, available_at
+    WITH failed AS (
+      UPDATE platform_jobs
+      SET status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'retrying' END,
+          available_at = CASE
+            WHEN attempts >= max_attempts THEN available_at
+            ELSE NOW() + make_interval(secs => $4::int)
+          END,
+          locked_by = NULL,
+          locked_at = NULL,
+          last_error = $3,
+          updated_at = NOW()
+      WHERE id = $1 AND locked_by = $2 AND status = 'processing'
+      RETURNING id, status, attempts, max_attempts, available_at, job_type, payload, last_error
+    ),
+    synced AS (
+      UPDATE platform_bot_inbound_updates AS inbox
+      SET state = 'dead_letter',
+          locked_by = NULL,
+          locked_at = NULL,
+          last_error = failed.last_error
+      FROM failed
+      WHERE failed.status = 'dead_letter'
+        AND failed.job_type IN ('telegram.master.update', 'telegram.intake.update')
+        AND inbox.bot_identity = failed.payload->>'botIdentity'
+        AND inbox.update_id = (failed.payload->>'updateId')::bigint
+      RETURNING inbox.id
+    )
+    SELECT id, status, attempts, max_attempts, available_at FROM failed
   `, [jobId, workerId, message, delay]);
   if (!saved.rowCount) throw new Error('Job lease lost before failure could be recorded');
   return saved.rows[0];
@@ -176,23 +212,94 @@ async function recoverExpiredPlatformJobs(pool, leaseSeconds = 120, jobTypes) {
   }
   const allowedTypes = normalizeJobTypes(jobTypes);
   const result = await pool.query(`
-        UPDATE platform_jobs
-        SET status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'retrying' END,
-            available_at = CASE
-              WHEN attempts >= max_attempts THEN available_at
-              ELSE NOW()
-            END,
-            locked_by = NULL,
-            locked_at = NULL,
-            last_error = LEFT(COALESCE(last_error, 'Worker lease expired'), 4000),
-            updated_at = NOW()
-        WHERE status = 'processing'
-          AND locked_at < NOW() - make_interval(secs => $1::int)
-          AND job_type = ANY($2::text[])
-        RETURNING id, status
+        WITH recovered AS (
+          UPDATE platform_jobs
+          SET status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'retrying' END,
+              available_at = CASE
+                WHEN attempts >= max_attempts THEN available_at
+                ELSE NOW()
+              END,
+              locked_by = NULL,
+              locked_at = NULL,
+              last_error = LEFT(COALESCE(last_error, 'Worker lease expired'), 4000),
+              updated_at = NOW()
+          WHERE status = 'processing'
+            AND locked_at < NOW() - make_interval(secs => $1::int)
+            AND job_type = ANY($2::text[])
+          RETURNING id, status, job_type, payload, last_error
+        ),
+        synced AS (
+          UPDATE platform_bot_inbound_updates AS inbox
+          SET state = 'dead_letter',
+              locked_by = NULL,
+              locked_at = NULL,
+              last_error = recovered.last_error
+          FROM recovered
+          WHERE recovered.status = 'dead_letter'
+            AND recovered.job_type IN ('telegram.master.update', 'telegram.intake.update')
+            AND inbox.bot_identity = recovered.payload->>'botIdentity'
+            AND inbox.update_id = (recovered.payload->>'updateId')::bigint
+          RETURNING inbox.id
+        )
+        SELECT id, status FROM recovered
       `, [leaseSeconds, allowedTypes]);
   return result.rows;
 }
+async function requeueDeadLetterPlatformBotUpdate(pool, { botIdentity, updateId }) {
+  if (!pool || typeof pool.query !== 'function') throw new TypeError('PostgreSQL pool is required');
+  if (!['master', 'intake'].includes(botIdentity)) {
+    throw new TypeError('botIdentity must be master or intake');
+  }
+  if (!Number.isSafeInteger(updateId) || updateId < 0) {
+    throw new TypeError('A valid updateId is required');
+  }
+
+  const result = await pool.query(`
+    WITH requeued AS (
+      UPDATE platform_jobs
+      SET status = 'queued',
+          attempts = 0,
+          available_at = NOW(),
+          locked_by = NULL,
+          locked_at = NULL,
+          last_error = NULL,
+          updated_at = NOW()
+      WHERE job_type = $1
+        AND idempotency_key = $2
+        AND status = 'dead_letter'
+        AND EXISTS (
+          SELECT 1 FROM platform_bot_inbound_updates AS inbox
+          WHERE inbox.bot_identity = $3
+            AND inbox.update_id = $4
+            AND inbox.state = 'dead_letter'
+        )
+      RETURNING id
+    )
+    UPDATE platform_bot_inbound_updates AS inbox
+    SET state = 'queued',
+        attempts = 0,
+        available_at = NOW(),
+        locked_by = NULL,
+        locked_at = NULL,
+        last_error = NULL
+    FROM requeued
+    WHERE inbox.bot_identity = $3
+      AND inbox.update_id = $4
+      AND inbox.state = 'dead_letter'
+    RETURNING inbox.id, requeued.id AS job_id
+  `, [
+    'telegram.' + botIdentity + '.update',
+    'telegram.' + botIdentity + '.update:' + updateId,
+    botIdentity,
+    updateId
+  ]);
+
+  if (!result.rowCount) {
+    return { requeued: false, id: null, jobId: null };
+  }
+  return { requeued: true, id: result.rows[0].id, jobId: result.rows[0].job_id };
+}
+
 async function enqueueTelegramUpdate(pool, { botId, update }) {
   if (!Number.isSafeInteger(Number(botId)) || Number(botId) < 1) {
     throw new TypeError('A valid botId is required');
@@ -317,5 +424,6 @@ module.exports = {
   failPlatformJob,
   recoverExpiredPlatformJobs,
   enqueueTelegramUpdate,
-  enqueuePlatformBotUpdate
+  enqueuePlatformBotUpdate,
+  requeueDeadLetterPlatformBotUpdate
 };
