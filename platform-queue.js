@@ -267,6 +267,12 @@ async function requeueDeadLetterPlatformBotUpdate(pool, { botIdentity, updateId 
       WHERE job_type = $1
         AND idempotency_key = $2
         AND status = 'dead_letter'
+        AND EXISTS (
+          SELECT 1 FROM platform_bot_inbound_updates AS inbox
+          WHERE inbox.bot_identity = $3
+            AND inbox.update_id = $4
+            AND inbox.state = 'dead_letter'
+        )
       RETURNING id
     )
     UPDATE platform_bot_inbound_updates AS inbox
